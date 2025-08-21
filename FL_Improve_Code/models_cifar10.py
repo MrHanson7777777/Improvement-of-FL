@@ -1,0 +1,566 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+CIFAR-10数据集专用优化模型
+==========================
+
+本文件包含针对CIFAR-10自然图像分类数据集（32x32像素，3通道彩色图像，10个类别）
+优化设计的深度学习模型，包括：
+
+1. ResNet18联邦学习版本 - 使用GroupNorm替代BatchNorm，适用于联邦学习场景
+2. EfficientNet风格模型 - 使用MobileNet倒置残差块
+
+所有模型都针对CIFAR-10数据集的特点进行了优化，在联邦学习场景下
+具有良好的收敛性和泛化能力。
+
+数据集特点：
+- 图像尺寸: 32x32
+- 通道数: 3 (RGB彩色图像)
+- 类别数: 10 (飞机、汽车、鸟类、猫、鹿、狗、青蛙、马、船、卡车)
+- 训练样本: 50,000
+- 测试样本: 10,000
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class BasicBlock_CIFAR10(nn.Module):
+    """
+    CIFAR-10专用ResNet基础块
+    ========================
+    
+    针对32x32图像优化的ResNet基础残差块。
+    使用较小的卷积核和适中的通道数，适合CIFAR-10的图像尺寸。
+    
+    Args:
+        in_planes (int): 输入通道数
+        planes (int): 输出通道数
+        stride (int): 卷积步长，默认为1
+    """
+    expansion = 1  # 基础块的扩展因子，始终为1
+    
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock_CIFAR10, self).__init__()
+        
+        # 第一个3x3卷积层，可能包含下采样
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, 
+                              padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        
+        # 第二个3x3卷积层，保持特征图尺寸
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, 
+                              padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        
+        # 短路连接：当输入输出维度不匹配时，使用1x1卷积调整
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes)
+            )
+
+    def forward(self, x):
+        """前向传播"""
+        # 第一个卷积-BN-ReLU
+        out = F.relu(self.bn1(self.conv1(x)))
+        # 第二个卷积-BN
+        out = self.bn2(self.conv2(out))
+        # 添加残差连接
+        out += self.shortcut(x)
+        # 最终ReLU激活
+        out = F.relu(out)
+        return out
+
+
+class ResNet18_CIFAR10_Fed(nn.Module):
+    """
+    CIFAR-10专用联邦学习ResNet18模型
+    ================================
+    
+    专门为联邦学习场景设计的ResNet18变体，针对CIFAR-10数据集优化。
+    使用GroupNorm替代BatchNorm，提高在非独立同分布数据上的性能。
+    
+    网络架构：
+    - 输入：32x32x3的RGB图像
+    - 4个残差层：[2, 2, 2, 2]个基础块
+    - 输出：10个类别的概率分布
+    
+    联邦学习优化：
+    1. 使用GroupNorm替代BatchNorm
+    2. 适当的Dropout防止过拟合
+    3. 自适应池化减少参数敏感性
+    
+    Args:
+        num_classes (int): 分类类别数，默认10
+        use_groupnorm (bool): 是否使用GroupNorm替代BatchNorm
+        num_groups (int): GroupNorm的组数，默认8
+    """
+    
+    def __init__(self, num_classes=10, use_groupnorm=True, num_groups=8):
+        super(ResNet18_CIFAR10_Fed, self).__init__()
+        self.in_planes = 64  # 当前通道数追踪
+        self.use_groupnorm = use_groupnorm
+        self.num_groups = num_groups
+        
+        # 初始卷积层：3x3卷积，不降采样以保持CIFAR-10的小尺寸
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        
+        # 4个残差层，通道数依次为[64, 128, 256, 512]
+        self.layer1 = self._make_layer(64, 2, stride=1)   # 32x32 -> 32x32
+        self.layer2 = self._make_layer(128, 2, stride=2)  # 32x32 -> 16x16
+        self.layer3 = self._make_layer(256, 2, stride=2)  # 16x16 -> 8x8
+        self.layer4 = self._make_layer(512, 2, stride=2)  # 8x8 -> 4x4
+        
+        # 分类头：自适应平均池化 + 全连接层
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))  # 4x4 -> 1x1
+        self.fc = nn.Linear(512, num_classes)
+        
+        # 如果启用GroupNorm，替换所有BatchNorm
+        if use_groupnorm:
+            self._replace_bn_with_gn()
+        
+        # 初始化模型权重
+        self._initialize_weights()
+
+    def _make_layer(self, planes, blocks, stride):
+        """
+        构建残差层
+        
+        Args:
+            planes (int): 该层的输出通道数
+            blocks (int): 该层包含的基础块数量
+            stride (int): 第一个块的步长
+        """
+        strides = [stride] + [1] * (blocks - 1)  # 只有第一个块可能有下采样
+        layers = []
+        for s in strides:
+            layers.append(BasicBlock_CIFAR10(self.in_planes, planes, s))
+            self.in_planes = planes  # 更新当前通道数
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        """前向传播"""
+        # 初始特征提取
+        out = F.relu(self.bn1(self.conv1(x)))  # [B, 3, 32, 32] -> [B, 64, 32, 32]
+        
+        # 四个残差层
+        out = self.layer1(out)  # [B, 64, 32, 32] -> [B, 64, 32, 32]
+        out = self.layer2(out)  # [B, 64, 32, 32] -> [B, 128, 16, 16]
+        out = self.layer3(out)  # [B, 128, 16, 16] -> [B, 256, 8, 8]
+        out = self.layer4(out)  # [B, 256, 8, 8] -> [B, 512, 4, 4]
+        
+        # 全局平均池化和分类
+        out = self.avgpool(out)     # [B, 512, 4, 4] -> [B, 512, 1, 1]
+        out = torch.flatten(out, 1) # [B, 512, 1, 1] -> [B, 512]
+        out = self.fc(out)          # [B, 512] -> [B, num_classes]
+        
+        # 返回对数概率用于NLLLoss
+        return F.log_softmax(out, dim=1)
+    
+    def _replace_bn_with_gn(self):
+        """
+        将BatchNorm替换为GroupNorm，提高联邦学习性能
+        
+        GroupNorm不依赖批次统计，更适合联邦学习中的非IID数据分布
+        """
+        def replace_bn(module):
+            for name, child in module.named_children():
+                if isinstance(child, nn.BatchNorm2d):
+                    num_channels = child.num_features
+                    # 确保组数不超过通道数
+                    groups = min(self.num_groups, num_channels)
+                    gn = nn.GroupNorm(groups, num_channels)
+                    setattr(module, name, gn)
+                else:
+                    # 递归处理子模块
+                    replace_bn(child)
+        
+        replace_bn(self)
+    
+    def _initialize_weights(self):
+        """
+        权重初始化
+        
+        使用He初始化用于ReLU网络，提高训练稳定性
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # He初始化，适用于ReLU激活函数
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                # BN/GN参数初始化
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                # 全连接层小随机初始化
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+
+class MBConvBlock_CIFAR10(nn.Module):
+    """
+    CIFAR-10专用MobileNet倒置残差块
+    ===============================
+    
+    基于EfficientNet的MBConv块，针对CIFAR-10优化。
+    使用深度可分离卷积和挤压激励注意力机制。
+    
+    结构：
+    1. 扩展阶段：1x1卷积增加通道数
+    2. 深度卷积：3x3深度可分离卷积
+    3. 注意力机制：SE模块
+    4. 投影阶段：1x1卷积恢复通道数
+    5. 残差连接：当输入输出尺寸相同时
+    
+    Args:
+        in_channels (int): 输入通道数
+        out_channels (int): 输出通道数
+        stride (int): 卷积步长
+        expand_ratio (int): 通道扩展倍数
+        se_ratio (float): SE模块的压缩比例
+    """
+    
+    def __init__(self, in_channels, out_channels, stride, expand_ratio, se_ratio=0.25):
+        super(MBConvBlock_CIFAR10, self).__init__()
+        self.stride = stride
+        # 只有当步长为1且输入输出通道相同时才使用残差连接
+        self.use_residual = stride == 1 and in_channels == out_channels
+        
+        # 1. 扩展阶段：增加通道数以提取更丰富特征
+        if expand_ratio != 1:
+            expanded_channels = in_channels * expand_ratio
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(in_channels, expanded_channels, 1, bias=False),
+                nn.BatchNorm2d(expanded_channels),
+                nn.ReLU(inplace=True)
+            )
+            self.has_expansion = True
+        else:
+            # 扩展比例为1时，跳过扩展阶段
+            expanded_channels = in_channels
+            self.expand_conv = nn.Identity()
+            self.has_expansion = False
+            
+        self.expanded_channels = expanded_channels
+            
+        # 2. 深度可分离卷积：减少参数量和计算量
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(expanded_channels, expanded_channels, 3, stride, 1, 
+                     groups=expanded_channels, bias=False),  # 每个通道独立卷积
+            nn.BatchNorm2d(expanded_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 3. 挤压激励（SE）注意力模块：自适应特征重标定
+        if se_ratio > 0:
+            se_channels = max(1, int(in_channels * se_ratio))
+            self.se = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),  # 全局平均池化
+                nn.Conv2d(expanded_channels, se_channels, 1),  # 压缩
+                nn.ReLU(inplace=True),
+                nn.Conv2d(se_channels, expanded_channels, 1),  # 恢复
+                nn.Sigmoid()  # 输出权重
+            )
+        else:
+            self.se = nn.Identity()
+            
+        # 4. 点卷积投影：恢复到目标通道数
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(expanded_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
+            # 注意：这里不使用激活函数，保持线性变换
+        )
+        
+    def forward(self, x):
+        """前向传播"""
+        identity = x  # 保存输入用于残差连接
+        
+        # 1. 扩展阶段
+        if self.has_expansion:
+            x = self.expand_conv(x)
+        
+        # 2. 深度可分离卷积
+        x = self.depthwise_conv(x)
+        
+        # 3. 挤压激励注意力
+        if hasattr(self.se, 'weight') or len(list(self.se.modules())) > 1:
+            se_weight = self.se(x)  # 计算注意力权重
+            x = x * se_weight       # 特征重标定
+            
+        # 4. 点卷积投影
+        x = self.project_conv(x)
+        
+        # 5. 残差连接（如果适用）
+        if self.use_residual:
+            x = x + identity
+            
+        return x
+
+
+class EfficientNet_CIFAR10(nn.Module):
+    """
+    CIFAR-10专用EfficientNet风格模型
+    ================================
+    
+    基于EfficientNet-B0的简化版本，专门为CIFAR-10优化。
+    使用MBConv块和复合缩放，在准确性和效率间取得平衡。
+    
+    网络架构：
+    - Stem层：初始特征提取（32x32x3 -> 32x32x32）
+    - 7个MBConv阶段：逐步增加通道数，减少空间尺寸
+    - Head层：最终分类（包含特征聚合和分类器）
+    
+    设计原则：
+    1. 适应32x32输入尺寸，减少不必要的下采样
+    2. 平衡准确性和计算效率
+    3. 使用注意力机制提升性能
+    4. 复合缩放策略优化深度、宽度和分辨率
+    
+    Args:
+        num_classes (int): 分类类别数，默认10
+    """
+    
+    def __init__(self, num_classes=10):
+        super(EfficientNet_CIFAR10, self).__init__()
+        
+        # Stem层：初始特征提取
+        # 使用较小的步长以适应CIFAR-10的小尺寸图像
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        
+        # EfficientNet-B0风格的MBConv块配置
+        # 每个stage: (输入通道, 输出通道, 块数量, 步长, 扩展比例)
+        self.stage1 = self._make_stage(32, 16, 1, 1, expand_ratio=1)     # 32x32
+        self.stage2 = self._make_stage(16, 24, 2, 2, expand_ratio=6)     # 16x16
+        self.stage3 = self._make_stage(24, 40, 2, 2, expand_ratio=6)     # 8x8
+        self.stage4 = self._make_stage(40, 80, 3, 2, expand_ratio=6)     # 4x4
+        self.stage5 = self._make_stage(80, 112, 3, 1, expand_ratio=6)    # 4x4
+        self.stage6 = self._make_stage(112, 192, 4, 2, expand_ratio=6)   # 2x2
+        self.stage7 = self._make_stage(192, 320, 1, 1, expand_ratio=6)   # 2x2
+        
+        # Head层：特征聚合和分类
+        self.head_conv = nn.Conv2d(320, 1280, kernel_size=1, bias=False)  # 特征聚合
+        self.head_bn = nn.BatchNorm2d(1280)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)  # 全局平均池化
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.2),  # 防止过拟合
+            nn.Linear(1280, num_classes)
+        )
+        
+        # 权重初始化
+        self._initialize_weights()
+        
+    def _make_stage(self, in_channels, out_channels, num_blocks, stride, expand_ratio):
+        """
+        构建MBConv阶段
+        
+        Args:
+            in_channels (int): 输入通道数
+            out_channels (int): 输出通道数
+            num_blocks (int): 该阶段的块数量
+            stride (int): 第一个块的步长
+            expand_ratio (int): 通道扩展倍数
+        """
+        layers = []
+        # 第一个块可能有下采样
+        layers.append(MBConvBlock_CIFAR10(in_channels, out_channels, stride, expand_ratio))
+        # 后续块保持空间尺寸
+        for _ in range(1, num_blocks):
+            layers.append(MBConvBlock_CIFAR10(out_channels, out_channels, 1, expand_ratio))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """前向传播"""
+        # Stem层特征提取
+        x = self.stem(x)        # [B, 3, 32, 32] -> [B, 32, 32, 32]
+        
+        # 7个MBConv阶段
+        x = self.stage1(x)      # [B, 32, 32, 32] -> [B, 16, 32, 32]
+        x = self.stage2(x)      # [B, 16, 32, 32] -> [B, 24, 16, 16]
+        x = self.stage3(x)      # [B, 24, 16, 16] -> [B, 40, 8, 8]
+        x = self.stage4(x)      # [B, 40, 8, 8] -> [B, 80, 4, 4]
+        x = self.stage5(x)      # [B, 80, 4, 4] -> [B, 112, 4, 4]
+        x = self.stage6(x)      # [B, 112, 4, 4] -> [B, 192, 2, 2]
+        x = self.stage7(x)      # [B, 192, 2, 2] -> [B, 320, 2, 2]
+        
+        # Head层分类
+        x = F.relu(self.head_bn(self.head_conv(x)))  # [B, 320, 2, 2] -> [B, 1280, 2, 2]
+        x = self.avgpool(x)                          # [B, 1280, 2, 2] -> [B, 1280, 1, 1]
+        x = torch.flatten(x, 1)                      # [B, 1280, 1, 1] -> [B, 1280]
+        x = self.classifier(x)                       # [B, 1280] -> [B, num_classes]
+        
+        # 返回对数概率用于NLLLoss
+        return F.log_softmax(x, dim=1)
+    
+    def _initialize_weights(self):
+        """
+        权重初始化
+        
+        使用适合不同层类型的初始化策略
+        """
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # 卷积层使用He初始化
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                # BN层参数初始化
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                # 全连接层小随机初始化
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+
+def replace_bn_with_gn(model, num_groups=8):
+    """
+    将模型中的BatchNorm2d替换为GroupNorm
+    ====================================
+    
+    在联邦学习场景中，GroupNorm通常比BatchNorm表现更好，
+    因为它不依赖于批次统计信息，更适合非独立同分布的数据。
+    
+    GroupNorm将通道分组进行归一化，不受批次大小影响，
+    在联邦学习的小批次训练中更加稳定。
+    
+    参数:
+        model (nn.Module): 要修改的模型
+        num_groups (int): GroupNorm的组数，默认8
+    
+    返回:
+        nn.Module: 修改后的模型
+    """
+    for name, module in model.named_children():
+        if isinstance(module, nn.BatchNorm2d):
+            num_channels = module.num_features
+            # 确保组数不超过通道数，避免分组错误
+            if num_channels < num_groups:
+                groups = num_channels
+            else:
+                groups = num_groups
+            # 创建对应的GroupNorm层
+            gn = nn.GroupNorm(groups, num_channels)
+            setattr(model, name, gn)
+        else:
+            # 递归处理子模块
+            replace_bn_with_gn(module, num_groups)
+    return model
+
+
+def get_cifar10_model(model_type='resnet18_fed', **kwargs):
+    """
+    CIFAR-10模型工厂函数
+    ====================
+    
+    根据指定类型返回相应的CIFAR-10模型实例。
+    提供统一的模型创建接口，便于实验和部署。
+    
+    参数:
+        model_type (str): 模型类型
+            - 'resnet18_fed': ResNet18联邦学习版本（默认）
+            - 'efficientnet': EfficientNet风格模型
+        **kwargs: 模型特定参数，会传递给对应的模型构造函数
+    
+    返回:
+        nn.Module: 对应的模型实例
+    
+    异常:
+        ValueError: 当指定的模型类型不存在时抛出
+    """
+    if model_type == 'resnet18_fed':
+        return ResNet18_CIFAR10_Fed(**kwargs)
+    elif model_type == 'efficientnet':
+        return EfficientNet_CIFAR10(**kwargs)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}. "
+                        f"Available types: ['resnet18_fed', 'efficientnet']")
+
+
+# 模型配置预设
+# ============
+# 预定义的模型配置，便于快速实验和部署
+CIFAR10_MODEL_CONFIGS = {
+    'resnet18_fed_default': {
+        'model_type': 'resnet18_fed',
+        'use_groupnorm': True,      # 使用GroupNorm，适合联邦学习
+        'num_groups': 8             # GroupNorm分组数
+    },
+    'resnet18_fed_bn': {
+        'model_type': 'resnet18_fed',
+        'use_groupnorm': False      # 使用BatchNorm，适合传统训练
+    },
+    'efficientnet_default': {
+        'model_type': 'efficientnet'
+    }
+}
+
+
+if __name__ == "__main__":
+    """
+    模型测试和验证
+    ==============
+    
+    测试所有模型的实例化和前向传播，验证模型正确性
+    """
+    import torch
+    
+    # 创建测试输入：模拟CIFAR-10的批次数据
+    test_input = torch.randn(4, 3, 32, 32)  # batch_size=4, channels=3, height=32, width=32
+    
+    print("CIFAR-10模型测试")
+    print("=" * 50)
+    
+    # 测试所有预定义的模型配置
+    for config_name, config in CIFAR10_MODEL_CONFIGS.items():
+        print(f"\n测试配置: {config_name}")
+        print("-" * 30)
+        
+        # 创建模型实例
+        model = get_cifar10_model(**config)
+        
+        # 计算模型参数量
+        param_count = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        # 前向传播测试
+        model.eval()  # 设置为评估模式
+        with torch.no_grad():
+            output = model(test_input)
+        
+        # 打印模型信息
+        print(f"  模型类型: {config['model_type']}")
+        print(f"  总参数量: {param_count:,}")
+        print(f"  可训练参数: {trainable_params:,}")
+        print(f"  输出形状: {output.shape}")
+        print(f"  输出范围: [{output.min():.4f}, {output.max():.4f}]")
+        
+        # 验证输出形状正确性
+        assert output.shape == (4, 10), f"输出形状错误: {output.shape}"
+        print("  ✓ 前向传播测试通过")
+    
+    # 测试GroupNorm替换功能
+    print(f"\n测试GroupNorm替换功能")
+    print("-" * 30)
+    
+    # 创建使用BatchNorm的模型
+    model_bn = ResNet18_CIFAR10_Fed(use_groupnorm=False)
+    print(f"  替换前BatchNorm层数: {len([m for m in model_bn.modules() if isinstance(m, nn.BatchNorm2d)])}")
+    
+    # 替换为GroupNorm
+    model_gn = replace_bn_with_gn(model_bn, num_groups=8)
+    bn_count = len([m for m in model_gn.modules() if isinstance(m, nn.BatchNorm2d)])
+    gn_count = len([m for m in model_gn.modules() if isinstance(m, nn.GroupNorm)])
+    
+    print(f"  替换后BatchNorm层数: {bn_count}")
+    print(f"  替换后GroupNorm层数: {gn_count}")
+    print("  ✓ GroupNorm替换功能测试完成")
+    
+    print(f"\n所有测试完成！")
